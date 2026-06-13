@@ -182,6 +182,104 @@ def renderStations(stations, screen_id='default'):
     return drawText
 
 
+# Vertical pitch (text height + gap) used between tube board rows.
+TUBE_ROW_HEIGHT = 12
+# How long each secondary-departure window is held still before scrolling on.
+TUBE_CYCLE_HOLD_SECONDS = 4
+# Pixels to advance per frame while a row animates upward.
+TUBE_CYCLE_SCROLL_STEP = 1
+
+
+class TubeCycleState:
+    def __init__(self):
+        self.topIndex = 0
+        self.offset = 0  # 0 = holding still; >0 = mid-scroll (pixels travelled)
+        self.holdUntil = time.time() + TUBE_CYCLE_HOLD_SECONDS
+
+
+# Dictionary to store the cycling state for each screen's secondary rows
+tubeCycleStates = {}
+
+
+def _drawTubeLine(draw, departure, order, y, destWidth, regionWidth):
+    """Draw a single tube departure (order + destination on the left, mins on the
+    right) at a vertical offset, clipping the destination so it can't run into
+    the countdown."""
+    destinationName = departure["destination_name"]
+    text = f"{order}  {destinationName}"
+    w, h, destBitmap = cachedBitmapText(text, font)
+    if w > destWidth:
+        destBitmap = destBitmap.crop((0, 0, destWidth, h))
+    draw.bitmap((0, y), destBitmap, fill="yellow")
+
+    mins = departure.get("mins_display", "")
+    mw, _, minsBitmap = cachedBitmapText(mins, font)
+    draw.bitmap((regionWidth - mw, y), minsBitmap, fill="yellow")
+
+
+def renderSecondaryTubeDepartures(departures, screen_id, numVisible, destWidth, regionWidth):
+    """Cycle through the departures below the first one, scrolling the visible
+    window upward one departure at a time. The window keeps the departures in
+    order and never wraps past the end of the list: with two visible rows it
+    steps 2,3 -> 3,4 -> ... -> (last pair) and then resets back to 2,3; with one
+    visible row (when a service message takes the bottom row) it steps
+    2 -> 3 -> ... -> (last) and then resets back to 2."""
+    secondary = departures[1:]
+
+    def drawText(draw, *_):
+        if not secondary:
+            return
+
+        n = len(secondary)
+
+        if screen_id not in tubeCycleStates:
+            tubeCycleStates[screen_id] = TubeCycleState()
+        state = tubeCycleStates[screen_id]
+
+        # nothing to cycle through: just show what we have, statically
+        if n <= numVisible:
+            state.topIndex = 0
+            state.offset = 0
+            for slot in range(n):
+                dep = secondary[slot]
+                _drawTubeLine(draw, dep, slot + 2, slot * TUBE_ROW_HEIGHT, destWidth, regionWidth)
+            return
+
+        # the last window keeps the final departures in order and fully visible
+        maxTop = n - numVisible
+
+        now = time.time()
+        if state.offset == 0:
+            # holding the current window; advance once the dwell elapses
+            if now >= state.holdUntil:
+                if state.topIndex >= maxTop:
+                    # reached the final in-order window; snap back to the start
+                    # rather than wrapping departures out of order
+                    state.topIndex = 0
+                    state.holdUntil = now + TUBE_CYCLE_HOLD_SECONDS
+                else:
+                    state.offset = TUBE_CYCLE_SCROLL_STEP
+        else:
+            state.offset += TUBE_CYCLE_SCROLL_STEP
+            if state.offset >= TUBE_ROW_HEIGHT:
+                state.offset = 0
+                state.topIndex += 1
+                state.holdUntil = now + TUBE_CYCLE_HOLD_SECONDS
+
+        # render one extra slot so the incoming departure slides up from below;
+        # skip any slot past the end of the list so departures never wrap around
+        for slot in range(numVisible + 1):
+            idx = state.topIndex + slot
+            if idx >= n:
+                continue
+            dep = secondary[idx]
+            order = idx + 2
+            y = slot * TUBE_ROW_HEIGHT - state.offset
+            _drawTubeLine(draw, dep, order, y, destWidth, regionWidth)
+
+    return drawText
+
+
 def renderTime(draw, width, *_):
     rawTime = datetime.now().time()
     hour, minute, second = str(rawTime).split('.')[0].split(':')
@@ -569,10 +667,11 @@ def drawSignage(device, width, height, data, screen_id='default'):
 def drawSignageTube(device, width, height, data, screen_id='default', serviceMessage=""):
     """London Underground / DLR style board: arrival order + destination on the
     left and a 'mins' countdown on the right. The first departure has a scrolling
-    position line beneath it showing its platform and live location, followed by
-    a second departure. The bottom row shows a scrolling service information
-    message when there is one, otherwise it falls back to a third departure,
-    followed by the clock."""
+    position line beneath it showing its platform and live location. Below that,
+    the remaining departures cycle through a window that scrolls upward one
+    departure at a time. A service information message, when present, takes the
+    bottom row (leaving a single cycling row); otherwise two rows cycle. The clock
+    sits along the bottom."""
     virtualViewport = viewport(device, width=width, height=height)
 
     departures, _, departureStation = data
@@ -604,20 +703,23 @@ def drawSignageTube(device, width, height, data, screen_id='default', serviceMes
     if statusLine:
         hotspots.append((snapshot(width, 10, renderStations(statusLine, screen_id), interval=0.02), (0, 12)))
 
-    # row 3: second departure
-    if len(departures) > 1:
-        second = departures[1]
-        hotspots.append((snapshot(destWidth, 10, renderTubeDestination(second, font, 2), interval=config["refreshTime"]), (0, 24)))
-        hotspots.append((snapshot(minsWidth, 10, renderTubeMins(second), interval=config["refreshTime"]), (width - minsWidth, 24)))
-
-    # bottom row: a service information message takes priority when present;
-    # otherwise fall back to showing a third departure
+    # rows below the first departure cycle through the remaining departures,
+    # scrolling the visible window upward one departure at a time. When a service
+    # information message is present it claims the bottom row, leaving a single
+    # cycling row (2 -> 3 -> 4 -> ...); otherwise two rows cycle (2,3 -> 3,4 -> ...).
     if serviceMessage:
+        numVisible = 1
+        hotspots.append((snapshot(
+            width, TUBE_ROW_HEIGHT * numVisible,
+            renderSecondaryTubeDepartures(departures, screen_id, numVisible, destWidth, width),
+            interval=0.02), (0, 24)))
         hotspots.append((snapshot(width, 10, renderStations("Service update: " + serviceMessage, screen_id + "-status"), interval=0.02), (0, 36)))
-    elif len(departures) > 2:
-        third = departures[2]
-        hotspots.append((snapshot(destWidth, 10, renderTubeDestination(third, font, 3), interval=config["refreshTime"]), (0, 36)))
-        hotspots.append((snapshot(minsWidth, 10, renderTubeMins(third), interval=config["refreshTime"]), (width - minsWidth, 36)))
+    elif len(departures) > 1:
+        numVisible = 2
+        hotspots.append((snapshot(
+            width, TUBE_ROW_HEIGHT * numVisible,
+            renderSecondaryTubeDepartures(departures, screen_id, numVisible, destWidth, width),
+            interval=0.02), (0, 24)))
 
     rowTime = snapshot(width, 14, renderTime, interval=0.1)
 
