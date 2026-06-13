@@ -566,11 +566,13 @@ def drawSignage(device, width, height, data, screen_id='default'):
 
     return virtualViewport
 
-def drawSignageTube(device, width, height, data, screen_id='default'):
+def drawSignageTube(device, width, height, data, screen_id='default', serviceMessage=""):
     """London Underground / DLR style board: arrival order + destination on the
     left and a 'mins' countdown on the right. The first departure has a scrolling
-    status line beneath it showing its platform and live location (mirroring the
-    National Rail 'calling at' scroller), followed by two more departures and the clock."""
+    position line beneath it showing its platform and live location, followed by
+    a second departure. The bottom row shows a scrolling service information
+    message when there is one, otherwise it falls back to a third departure,
+    followed by the clock."""
     virtualViewport = viewport(device, width=width, height=height)
 
     departures, _, departureStation = data
@@ -578,7 +580,7 @@ def drawSignageTube(device, width, height, data, screen_id='default'):
     width = virtualViewport.width
 
     if len(departures) == 0:
-        noTrains = drawBlankSignage(device, width=width, height=height, departureStation=departureStation)
+        noTrains = drawBlankSignage(device, width=width, height=height, departureStation=departureStation, serviceMessage=serviceMessage)
         return noTrains
 
     # reserve space on the right for the longest expected countdown
@@ -587,33 +589,35 @@ def drawSignageTube(device, width, height, data, screen_id='default'):
     gap = 5
     destWidth = width - minsWidth - gap
 
-    firstFont = font
-    if config['firstDepartureBold']:
-        firstFont = fontBold
-
-    # build the scrolling status line for the first departure
+    # build the scrolling position/location line for the first departure
     first = departures[0]
     statusParts = [p for p in [first.get("platform_name", ""), first.get("current_location", "")] if p]
     statusLine = "  --  ".join(statusParts)
 
     hotspots = []
 
-    # row 1: first departure
-    hotspots.append((snapshot(destWidth, 10, renderTubeDestination(first, firstFont, 1), interval=config["refreshTime"]), (0, 0)))
+    # row 1: first departure (same weight as the other rows)
+    hotspots.append((snapshot(destWidth, 10, renderTubeDestination(first, font, 1), interval=config["refreshTime"]), (0, 0)))
     hotspots.append((snapshot(minsWidth, 10, renderTubeMins(first), interval=config["refreshTime"]), (width - minsWidth, 0)))
 
     # row 2: scrolling platform + live location for the first departure
-    hotspots.append((snapshot(width, 10, renderStations(statusLine, screen_id), interval=0.02), (0, 12)))
+    if statusLine:
+        hotspots.append((snapshot(width, 10, renderStations(statusLine, screen_id), interval=0.02), (0, 12)))
 
-    # rows 3 & 4: the next two departures
-    nextYPositions = [24, 36]
-    for idx, y in enumerate(nextYPositions):
-        depIndex = idx + 1
-        if depIndex >= len(departures):
-            break
-        dep = departures[depIndex]
-        hotspots.append((snapshot(destWidth, 10, renderTubeDestination(dep, font, depIndex + 1), interval=config["refreshTime"]), (0, y)))
-        hotspots.append((snapshot(minsWidth, 10, renderTubeMins(dep), interval=config["refreshTime"]), (width - minsWidth, y)))
+    # row 3: second departure
+    if len(departures) > 1:
+        second = departures[1]
+        hotspots.append((snapshot(destWidth, 10, renderTubeDestination(second, font, 2), interval=config["refreshTime"]), (0, 24)))
+        hotspots.append((snapshot(minsWidth, 10, renderTubeMins(second), interval=config["refreshTime"]), (width - minsWidth, 24)))
+
+    # bottom row: a service information message takes priority when present;
+    # otherwise fall back to showing a third departure
+    if serviceMessage:
+        hotspots.append((snapshot(width, 10, renderStations("Service update: " + serviceMessage, screen_id + "-status"), interval=0.02), (0, 36)))
+    elif len(departures) > 2:
+        third = departures[2]
+        hotspots.append((snapshot(destWidth, 10, renderTubeDestination(third, font, 3), interval=config["refreshTime"]), (0, 36)))
+        hotspots.append((snapshot(minsWidth, 10, renderTubeMins(third), interval=config["refreshTime"]), (width - minsWidth, 36)))
 
     rowTime = snapshot(width, 14, renderTime, interval=0.1)
 
@@ -756,7 +760,7 @@ try:
                             station = data[2]
                             screenData = platform_filter(departureData, config["journey"]["screen1Platform"], station, config["journey"]["numericPlatformsOnly"])
                             if config["mode"] == "tube":
-                                virtual = drawSignageTube(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
+                                virtual = drawSignageTube(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1', serviceMessage=data[3])
                             else:
                                 virtual = drawSignage(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
 
@@ -775,7 +779,7 @@ try:
                                         device1, width=widgetWidth, height=widgetHeight, departureStation=data[2], serviceMessage=data[3])
                                 else:
                                     if config["mode"] == "tube":
-                                        virtual1 = drawSignageTube(device1, width=widgetWidth, height=widgetHeight, data=data1, screen_id='screen2')
+                                        virtual1 = drawSignageTube(device1, width=widgetWidth, height=widgetHeight, data=data1, screen_id='screen2', serviceMessage=data[3])
                                     else:
                                         virtual1 = drawSignage(device1, width=widgetWidth, height=widgetHeight, data=data1, screen_id='screen2')
 
