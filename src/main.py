@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 
 import requests
 
@@ -305,6 +306,48 @@ def loadData(apiConfig, journeyConfig, config):
         print("Error: Failed to fetch data from " + source)
         print(err.__context__)
         return False, False, journeyConfig['outOfHoursName'], ""
+
+
+class DataFetcher:
+    """Fetches departure data on a background thread so the slow network
+    request never blocks (and therefore never pauses) the render loop."""
+
+    def __init__(self, apiConfig, journeyConfig, config, refreshTime):
+        self._apiConfig = apiConfig
+        self._journeyConfig = journeyConfig
+        self._config = config
+        self._refreshTime = refreshTime
+        self._lock = threading.Lock()
+        self._data = None
+        self._hasData = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                result = loadData(self._apiConfig, self._journeyConfig, self._config)
+            except Exception as err:
+                print("Error: background data fetch failed")
+                print(err)
+                result = None
+
+            if result is not None:
+                with self._lock:
+                    self._data = result
+                self._hasData.set()
+
+            time.sleep(self._refreshTime)
+
+    def wait_for_first(self, timeout=None):
+        """Block until the first data set is available (used at startup)."""
+        return self._hasData.wait(timeout)
+
+    def get(self):
+        with self._lock:
+            return self._data
 
 
 def drawStartup(device, width, height):
@@ -667,6 +710,17 @@ try:
     last_data1 = None
     last_blank_state = None
 
+    # Fetch departure data on a background thread so the (slow) network request
+    # never blocks the render loop. Previously the synchronous fetch caused the
+    # scrolling animation to pause briefly every refreshTime seconds.
+    fetcher = None
+    if config["debug"] != True:
+        fetcher = DataFetcher(config["api"], config["journey"], config, config["refreshTime"])
+        fetcher.start()
+        # give the first request a chance to complete so we render real data
+        # immediately (the startup screen stays on the display until then)
+        fetcher.wait_for_first(timeout=config["refreshTime"])
+
     while True:
         with regulator:
             if len(blankHours) == 2 and isRun(blankHours[0], blankHours[1]):
@@ -678,30 +732,33 @@ try:
                 if timeNow - timeFPS >= config['fpsTime']:
                     timeFPS = time.time()
                     print('Effective FPS: ' + str(round(regulator.effective_FPS(), 2)))
-                if timeNow - timeAtStart >= config["refreshTime"]:
-                    # check if debug mode is enabled 
-                    if config["debug"] == True:
+
+                if config["debug"] == True:
+                    # debug screen is timer-driven (it makes no network request)
+                    if timeNow - timeAtStart >= config["refreshTime"]:
                         print(config["debug"])
                         virtual = drawDebugScreen(device, width=widgetWidth, height=widgetHeight, showTime=True)
                         if config['dualScreen']:
                             virtual1 = drawDebugScreen(device1, width=widgetWidth, height=widgetHeight, showTime=True, screen="2")
-                    else:
-                        data = loadData(config["api"], config["journey"], config)
-                        # Only recreate viewport if data has changed
-                        if data != last_data:
-                            last_data = data
-                            if data[0] is False:
-                                virtual = drawBlankSignage(
-                                    device, width=widgetWidth, height=widgetHeight, departureStation=data[2], serviceMessage=data[3])
+                        timeAtStart = time.time()
+                else:
+                    # pull the latest data produced by the background thread and
+                    # only rebuild the viewport(s) when the data actually changes
+                    data = fetcher.get()
+                    if data is not None and data != last_data:
+                        last_data = data
+                        if data[0] is False:
+                            virtual = drawBlankSignage(
+                                device, width=widgetWidth, height=widgetHeight, departureStation=data[2], serviceMessage=data[3])
+                        else:
+                            departureData = data[0]
+                            nextStations = data[1]
+                            station = data[2]
+                            screenData = platform_filter(departureData, config["journey"]["screen1Platform"], station, config["journey"]["numericPlatformsOnly"])
+                            if config["mode"] == "tube":
+                                virtual = drawSignageTube(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
                             else:
-                                departureData = data[0]
-                                nextStations = data[1]
-                                station = data[2]
-                                screenData = platform_filter(departureData, config["journey"]["screen1Platform"], station, config["journey"]["numericPlatformsOnly"])
-                                if config["mode"] == "tube":
-                                    virtual = drawSignageTube(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
-                                else:
-                                    virtual = drawSignage(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
+                                virtual = drawSignage(device, width=widgetWidth, height=widgetHeight, data=screenData, screen_id='screen1')
 
                         if config['dualScreen']:
                             if data[0] is False:
@@ -710,7 +767,7 @@ try:
                                 departureData = data[0]
                                 station = data[2]
                                 data1 = platform_filter(departureData, config["journey"]["screen2Platform"], station, config["journey"]["numericPlatformsOnly"])
-                            
+
                             if data1 != last_data1:
                                 last_data1 = data1
                                 if data[0] is False:
@@ -721,8 +778,6 @@ try:
                                         virtual1 = drawSignageTube(device1, width=widgetWidth, height=widgetHeight, data=data1, screen_id='screen2')
                                     else:
                                         virtual1 = drawSignage(device1, width=widgetWidth, height=widgetHeight, data=data1, screen_id='screen2')
-
-                    timeAtStart = time.time()
 
                 timeNow = time.time()
                 if virtual is not None:
