@@ -249,6 +249,17 @@ def loadTubeDeparturesForStation(journeyConfig, appKey, rows):
         params=params,
         timeout=10,
     )
+    if response.status_code == 404:
+        # A 404 here almost always means the configured departureStation is not a
+        # valid TfL StopPoint id (e.g. a typo like '940GZZLUWDG' instead of the
+        # real Wood Green id '940GZZLUWOG'). Fail loudly so it isn't mistaken for
+        # a genuine "no trains running" situation on the display.
+        raise ValueError(
+            "TfL StopPoint '" + stopPointId + "' was not recognised (HTTP 404). "
+            "Check the departureStation environment variable is a valid tube "
+            "StopPoint id, e.g. '940GZZLUWOG' for Wood Green. You can look one up "
+            "at https://api.tfl.gov.uk/StopPoint/Search/{name}?modes=tube"
+        )
     response.raise_for_status()
     arrivals = response.json()
 
